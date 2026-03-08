@@ -5,6 +5,20 @@ import argparse
 import torch.nn as nn
 from tqdm import tqdm
 
+from dataset import PixelSetData
+from torch.utils.data.sampler import WeightedRandomSampler
+from timematch_utils import label_utils
+from collections import Counter
+from dataset import PixelSetData, create_evaluation_loaders
+from timematch_utils.train_utils import bool_flag
+from transforms import (
+    Normalize,
+    RandomSamplePixels,
+    RandomSampleTimeSteps,
+    ToTensor,
+    AddPixelLabels
+)
+from torch.utils import data
 from utils import *
 
 
@@ -80,6 +94,30 @@ def parse_args():
     parser.add_argument('--cos', action='store_true',
                         help='use cosine lr schedule')
 
+    # 以下都是timematch
+    parser.add_argument(
+        "--num_workers", default=2, type=int, help="Number of workers"
+    )
+    parser.add_argument("--balance_source", type=bool_flag, default=True, help='class balanced batches for source')
+    parser.add_argument('--num_pixels', default=4096, type=int, help='Number of pixels to sample from the input sample')
+    parser.add_argument('--seq_length', default=30, type=int,
+                        help='Number of time steps to sample from the input sample')
+    # 数据路径与域
+    parser.add_argument('--data_root', default='/data/user/DBL/timematch_data', type=str,
+                        help='Path to datasets root directory')
+    # parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str,
+    #                     help='Path to datasets root directory')
+    parser.add_argument('--source', default='france/30TXT/2017', type=str)
+    parser.add_argument('--target', default='france/30TXT/2017', type=str)
+    # 类别处理
+    parser.add_argument('--combine_spring_and_winter', action='store_true')
+    # 数据划分
+    parser.add_argument('--num_folds', default=3, type=int)
+    parser.add_argument("--val_ratio", default=0.1, type=float)
+    parser.add_argument("--test_ratio", default=0.2, type=float)
+    # 评估
+    parser.add_argument('--sample_pixels_val', action='store_true')  # 布尔型开关参数（flag），它不需要传值，只需在命令行中出现或不出现该选项
+
     args = parser.parse_args()
 
     args.datapath = DATAPATH
@@ -106,6 +144,74 @@ def parse_args():
         torch.cuda.manual_seed_all(SEED)
 
     return args
+
+def get_data_loaders(splits, config, balance_source=True):
+
+    strong_aug = transforms.Compose([
+            RandomSamplePixels(config.num_pixels),
+            RandomSampleTimeSteps(config.seq_length),
+            Normalize(),
+            ToTensor(),
+            AddPixelLabels()
+    ])
+
+    source_dataset = PixelSetData(config.data_root, config.source,
+            config.classes, strong_aug,
+            indices=splits[config.source]['train'],)
+
+    if balance_source:
+        source_labels = source_dataset.get_labels()
+        freq = Counter(source_labels)
+        class_weight = {x: 1.0 / freq[x] for x in freq}
+        source_weights = [class_weight[x] for x in source_labels]
+        sampler = WeightedRandomSampler(source_weights, len(source_labels))
+        print("using balanced loader for source")
+        source_loader = data.DataLoader(
+            source_dataset,
+            num_workers=config.num_workers,
+            pin_memory=True,
+            sampler=sampler,
+            batch_size=config.batch_size,
+            drop_last=True,
+        )
+    else:
+        source_loader = data.DataLoader(
+            source_dataset,
+            num_workers=config.num_workers,
+            pin_memory=True,
+            batch_size=config.batch_size,
+            shuffle=True,
+            drop_last=True,
+        )
+    print(f'size of source dataset: {len(source_dataset)} ({len(source_loader)} batches)')
+
+    return source_loader
+
+def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1, test_ratio=0.2):
+    folds = []
+    for _ in range(num_folds):
+        splits = {}
+        for dataset in datasets:
+            if type(num_indices) == dict:
+                indices = list(range(num_indices[dataset]))
+            else:
+                indices = list(range(num_indices))
+            n = len(indices)
+            n_test = int(test_ratio * n)
+            n_val = int(val_ratio * n)
+            n_train = n - n_test - n_val
+
+            random.shuffle(indices)
+
+            train_indices = set(indices[:n_train])
+            val_indices = set(indices[n_train:n_train + n_val])
+            test_indices = set(indices[-n_test:])
+            assert set.intersection(train_indices, val_indices, test_indices) == set()
+            assert len(train_indices) + len(val_indices) + len(test_indices) == n
+
+            splits[dataset] = {'train': train_indices, 'val': val_indices, 'test': test_indices}
+        folds.append(splits)
+    return folds
 
 
 def train(args):
