@@ -94,29 +94,6 @@ def parse_args():
     parser.add_argument('--cos', action='store_true',
                         help='use cosine lr schedule')
 
-    # 以下都是timematch
-    parser.add_argument(
-        "--num_workers", default=2, type=int, help="Number of workers"
-    )
-    parser.add_argument("--balance_source", type=bool_flag, default=True, help='class balanced batches for source')
-    parser.add_argument('--num_pixels', default=4096, type=int, help='Number of pixels to sample from the input sample')
-    parser.add_argument('--seq_length', default=30, type=int,
-                        help='Number of time steps to sample from the input sample')
-    # 数据路径与域
-    parser.add_argument('--data_root', default='/data/user/DBL/timematch_data', type=str,
-                        help='Path to datasets root directory')
-    # parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str,
-    #                     help='Path to datasets root directory')
-    parser.add_argument('--source', default='france/30TXT/2017', type=str)
-    parser.add_argument('--target', default='france/30TXT/2017', type=str)
-    # 类别处理
-    parser.add_argument('--combine_spring_and_winter', action='store_true')
-    # 数据划分
-    parser.add_argument('--num_folds', default=3, type=int)
-    parser.add_argument("--val_ratio", default=0.1, type=float)
-    parser.add_argument("--test_ratio", default=0.2, type=float)
-    # 评估
-    parser.add_argument('--sample_pixels_val', action='store_true')  # 布尔型开关参数（flag），它不需要传值，只需在命令行中出现或不出现该选项
 
     args = parser.parse_args()
 
