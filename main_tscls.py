@@ -23,12 +23,11 @@ from transforms import (
     AddPixelLabels
 )
 from torch.utils import data
-
+import numpy as np
+import pandas as pd
+import random
 from utils import *
 
-DATAPATH = Path(r"data/US-toy")  # todo replace your datapath here
-YEARS = [2019]#, 2020, 2021]  # 3 testing years
-SEEDS = [111]#, 222, 333, 444, 555]  # 5 repeated trails
 
 import torch
 
@@ -340,7 +339,7 @@ def parse_args():
     args = parser.parse_args()
 
     args.dataset = 'USCrops'
-    args.datapath = DATAPATH
+
 
     modelname = args.model.lower()
     if args.interp and modelname in ['rf', 'tempcnn', 'lstm']:
@@ -364,7 +363,6 @@ def parse_args():
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 # ================== put a patch ===============
-    args.seq_length = args.sequencelength
     args.workers = args.num_workers
 # ==============================================
 
@@ -648,11 +646,11 @@ def test_epoch(model, criterion, dataloader, device, args):
 
 def main():
     args = parse_args()
-    years = YEARS
+    years = [2019]
     for year in years:
         print(f' ===================== {year} ======================= ')
         args.year = year
-        seeds = SEEDS
+        seeds = [111]
         print('seed in', seeds)
         for seed in seeds:
             args.seed = seed
