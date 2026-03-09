@@ -267,8 +267,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train an evaluate time series deep learning models.')
     parser.add_argument('model', type=str, default="STNet",
                         help='select model architecture.')
-    # parser.add_argument('--use-doy', action='store_true',
-    #                     help='whether to use doy pe with trsf')
+    parser.add_argument('--use-doy', action='store_true',
+                        help='whether to use doy pe with trsf')
     parser.add_argument('--rc', action='store_true',
                         help='whether to random choice the time series data')
     parser.add_argument('--interp', action='store_true',
@@ -314,8 +314,9 @@ def parse_args():
 
     # 以下都是timematch
     parser.add_argument(
-        "--num_workers", default=2, type=int, help="Number of workers"
+        "--num_workers", default=8, type=int, help="Number of workers"
     )
+    parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--balance_source", type=bool_flag, default=True, help='class balanced batches for source')
     parser.add_argument('--num_pixels', default=4096, type=int, help='Number of pixels to sample from the input sample')
     parser.add_argument('--seq_length', default=30, type=int,
@@ -362,7 +363,11 @@ def parse_args():
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
+# ================== put a patch ===============
     args.seq_length = args.sequencelength
+    args.workers = args.num_workers
+# ==============================================
+
     return args
 
 def get_data_loaders(splits, config, balance_source=True):
@@ -453,11 +458,8 @@ def train(args):
     sample_pixels_val = config.sample_pixels_val
     val_loader_dict, test_loader_dict = create_evaluation_loaders(config.source, splits, config, sample_pixels_val)
     source_loader_dict = get_data_loaders(splits, config, config.balance_source)
-    data, meta = get_sup_dataloader(args.model, args.datapath, args.year, args.batchsize, args.workers,
-                                    args.sequencelength,
-                                    args.num, args.interp, args.rc, args.useall, args.nclasses, args.seed)
 
-    num_classes = source_classes
+    num_classes = cfg.num_classes
     assert args.model not in ['rf', 'RF'] # 这两种模型的数据加载方式要求numpy数组
     ndims = 10
 
@@ -517,7 +519,7 @@ def train(args):
 
     if not args.eval:
         log = list()
-        val_loss_min = np.Inf
+        val_loss_min = np.inf
         print(f"Training {model.modelname}")
         for epoch in range(args.epochs):
             if args.warmup_epochs > 0:
