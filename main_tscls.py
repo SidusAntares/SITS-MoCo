@@ -30,13 +30,245 @@ DATAPATH = Path(r"data/US-toy")  # todo replace your datapath here
 YEARS = [2019]#, 2020, 2021]  # 3 testing years
 SEEDS = [111]#, 222, 333, 444, 555]  # 5 repeated trails
 
+import torch
+
+
+class TimeMatchToUSCropsAdapter:
+    """
+    将 PixelSetData 的输出转换为 STNet (USCrops 格式) 可接受的输入
+    """
+
+    def __init__(self, device):
+        self.device = device
+
+    def __call__(self, batch_dict):
+        """
+        输入: batch_dict (来自 PixelSetData loader)
+        输出: (X_tuple, y_tensor) 符合 STNet 训练循环的格式
+        """
+        pixels = batch_dict['pixels']  # (B, T, C, N)
+        positions = batch_dict['positions']  # (B, T)
+        valid_pixels = batch_dict['valid_pixels']  # (B, T, N)
+        pixel_labels = batch_dict['pixel_labels']  # (B, N)
+
+        B, T, C, N = pixels.shape
+
+        # 1. 展平像素维度: (B, T, C, N) -> (B*N, T, C)
+        data_flat = pixels.permute(0, 3, 1, 2).reshape(-1, T, C)
+
+        # 2. 扩展其他维度以匹配展平后的数据
+        # positions: (B, T) -> (B, 1, T) -> (B, N, T) -> (B*N, T)
+        doy_flat = positions.unsqueeze(1).expand(-1, N, -1).reshape(-1, T)
+
+        # mask: 这里 UScrops 的 mask 是基于 padding 的。
+        # PixelSetData 的 valid_pixels 指示哪些是真实像素。
+        # 我们需要构造一个全 1 的 mask (表示无 padding)，或者根据 valid_pixels 构造
+        # 假设 RandomSampleTimeSteps 已经保证了时间长度固定，这里主要关注有效像素
+        # 为了模拟 UScrops 的 mask (True=padding)，我们取反 valid_pixels (False=valid)
+        # 注意：UScrops mask shape is (B*N, T).
+        # 如果 valid_pixels 是 float (1.0/0.0)，转为 bool
+        valid_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T).bool()
+        mask_flat = ~valid_flat  # True where invalid/padding
+
+        # weight: 同样展平
+        weight_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T).float()
+        # 归一化权重 (可选，视模型需求)
+        # weight_flat = weight_flat / (weight_flat.sum(dim=1, keepdim=True) + 1e-9)
+
+        # 3. 处理标签: (B, N) -> (B*N,)
+        y_flat = pixel_labels.reshape(-1)
+
+        # 4. 构建 STNet 需要的 Tuple
+        # 顺序必须严格对应 USCrops.transform 的返回: (data, mask, doy, weight)
+        X_tuple = (
+            data_flat.to(self.device),
+            mask_flat.to(self.device),
+            doy_flat.to(self.device),
+            weight_flat.to(self.device)
+        )
+
+        y_tensor = y_flat.to(self.device)
+
+        return X_tuple, y_tensor
+
+    def train_epoch_with_adapter(model, optimizer, criterion, dict_dataloader, adapter, device, args):
+        """
+        专门用于处理 PixelSetData (Dict 格式) 的训练循环
+        """
+        losses = AverageMeter('Loss', ':.4e')
+        model.train()
+
+        with tqdm(enumerate(dict_dataloader), total=len(dict_dataloader), leave=True) as iterator:
+            for idx, batch_dict in iterator:
+                # 【核心步骤】使用 Adapter 将 Dict 转换为 (X_tuple, y)
+                try:
+                    X, y = adapter(batch_dict)
+                except Exception as e:
+                    print(f"Error adapting batch {idx}: {e}")
+                    continue
+
+                # 此时 X 已经是 tuple, y 是 tensor，且都在 device 上 (Adapter 内部处理了 to(device))
+                # 不需要再调用 recursive_todevice(X, device)，因为 Adapter 已经做了
+                # 但为了保险，如果 Adapter 没做全，可以保留 y 的 check
+                if y.device != device:
+                    y = y.to(device)
+
+                optimizer.zero_grad()
+
+                # 调用模型
+                if args.use_doy:
+                    logits = model(X, use_doy=True)
+                else:
+                    logits = model(X)
+
+                out = F.log_softmax(logits, dim=-1)
+                loss = criterion(out, y)
+
+                loss.backward()
+                optimizer.step()
+
+                iterator.set_description(f"train loss={loss:.2f}")
+                losses.update(loss.item(), y.size(0))
+
+        return losses.avg
+
+    def test_epoch_with_adapter(model, criterion, dict_dataloader, adapter, device, args):
+        """
+        专门用于处理 PixelSetData (Dict 格式) 的验证/测试循环
+        """
+        losses = AverageMeter('Loss', ':.4e')
+        model.eval()
+        y_true_list = list()
+        y_pred_list = list()
+
+        with torch.no_grad():
+            with tqdm(enumerate(dict_dataloader), total=len(dict_dataloader), leave=True) as iterator:
+                for idx, batch_dict in iterator:
+                    # 【核心步骤】转换数据
+                    try:
+                        X, y = adapter(batch_dict)
+                    except Exception as e:
+                        continue
+
+                    if y.device != device:
+                        y = y.to(device)
+
+                    if args.use_doy:
+                        logits = model(X, use_doy=True)
+                    else:
+                        logits = model(X)
+
+                    out = F.log_softmax(logits, dim=-1)
+                    loss = criterion(out, y)
+
+                    iterator.set_description(f"test loss={loss:.2f}")
+                    losses.update(loss.item(), y.size(0))
+
+                    y_true_list.append(y.cpu())
+                    y_pred_list.append(out.argmax(-1).cpu())
+
+        if len(y_true_list) == 0:
+            return losses.avg, {}  # 防止空列表报错
+
+        y_true = torch.cat(y_true_list).numpy()
+        y_pred = torch.cat(y_pred_list).numpy()
+
+        scores = accuracy(y_true, y_pred, args.nclasses + 1)
+        return losses.avg, scores
+
+
+def train_epoch_with_adapter(model, optimizer, criterion, dict_dataloader, adapter, device, args):
+    """
+    专门用于处理 PixelSetData (Dict 格式) 的训练循环
+    """
+    losses = AverageMeter('Loss', ':.4e')
+    model.train()
+
+    with tqdm(enumerate(dict_dataloader), total=len(dict_dataloader), leave=True) as iterator:
+        for idx, batch_dict in iterator:
+            # 【核心步骤】使用 Adapter 将 Dict 转换为 (X_tuple, y)
+            try:
+                X, y = adapter(batch_dict)
+            except Exception as e:
+                print(f"Error adapting batch {idx}: {e}")
+                continue
+
+            # 此时 X 已经是 tuple, y 是 tensor，且都在 device 上 (Adapter 内部处理了 to(device))
+            # 不需要再调用 recursive_todevice(X, device)，因为 Adapter 已经做了
+            # 但为了保险，如果 Adapter 没做全，可以保留 y 的 check
+            if y.device != device:
+                y = y.to(device)
+
+            optimizer.zero_grad()
+
+            # 调用模型
+            if args.use_doy:
+                logits = model(X, use_doy=True)
+            else:
+                logits = model(X)
+
+            out = F.log_softmax(logits, dim=-1)
+            loss = criterion(out, y)
+
+            loss.backward()
+            optimizer.step()
+
+            iterator.set_description(f"train loss={loss:.2f}")
+            losses.update(loss.item(), y.size(0))
+
+    return losses.avg
+
+
+def test_epoch_with_adapter(model, criterion, dict_dataloader, adapter, device, args):
+    """
+    专门用于处理 PixelSetData (Dict 格式) 的验证/测试循环
+    """
+    losses = AverageMeter('Loss', ':.4e')
+    model.eval()
+    y_true_list = list()
+    y_pred_list = list()
+
+    with torch.no_grad():
+        with tqdm(enumerate(dict_dataloader), total=len(dict_dataloader), leave=True) as iterator:
+            for idx, batch_dict in iterator:
+                # 【核心步骤】转换数据
+                try:
+                    X, y = adapter(batch_dict)
+                except Exception as e:
+                    continue
+
+                if y.device != device:
+                    y = y.to(device)
+
+                if args.use_doy:
+                    logits = model(X, use_doy=True)
+                else:
+                    logits = model(X)
+
+                out = F.log_softmax(logits, dim=-1)
+                loss = criterion(out, y)
+
+                iterator.set_description(f"test loss={loss:.2f}")
+                losses.update(loss.item(), y.size(0))
+
+                y_true_list.append(y.cpu())
+                y_pred_list.append(out.argmax(-1).cpu())
+
+    if len(y_true_list) == 0:
+        return losses.avg, {}  # 防止空列表报错
+
+    y_true = torch.cat(y_true_list).numpy()
+    y_pred = torch.cat(y_pred_list).numpy()
+
+    scores = accuracy(y_true, y_pred, args.nclasses + 1)
+    return losses.avg, scores
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train an evaluate time series deep learning models.')
     parser.add_argument('model', type=str, default="STNet",
                         help='select model architecture.')
-    parser.add_argument('--use-doy', action='store_true',
-                        help='whether to use doy pe with trsf')
+    # parser.add_argument('--use-doy', action='store_true',
+    #                     help='whether to use doy pe with trsf')
     parser.add_argument('--rc', action='store_true',
                         help='whether to random choice the time series data')
     parser.add_argument('--interp', action='store_true',
@@ -130,7 +362,7 @@ def parse_args():
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    args.seq_length = args.sequencelength
     return args
 
 def get_data_loaders(splits, config, balance_source=True):
@@ -219,57 +451,24 @@ def train(args):
                                         config.test_ratio)
     splits = folds[0]
     sample_pixels_val = config.sample_pixels_val
-    val_loader, test_loader = create_evaluation_loaders(config.source, splits, config, sample_pixels_val)
-    source_loader = get_data_loaders(splits, config, config.balance_source)
+    val_loader_dict, test_loader_dict = create_evaluation_loaders(config.source, splits, config, sample_pixels_val)
+    source_loader_dict = get_data_loaders(splits, config, config.balance_source)
     data, meta = get_sup_dataloader(args.model, args.datapath, args.year, args.batchsize, args.workers,
                                     args.sequencelength,
                                     args.num, args.interp, args.rc, args.useall, args.nclasses, args.seed)
 
-    num_classes = meta["num_classes"]
-    ndims = meta["ndims"]
+    num_classes = source_classes
+    assert args.model not in ['rf', 'RF'] # 这两种模型的数据加载方式要求numpy数组
+    ndims = 10
 
-    if args.model in ['rf', 'RF']:
-        X_train, y_train, X_test, y_test = data
-    else:
-        traindataloader, valdataloader, testdataloader = data
+    device = torch.device(args.device)
+    train_adapter = TimeMatchToUSCropsAdapter(device)
+    val_adapter = TimeMatchToUSCropsAdapter(device)
+    test_adapter = TimeMatchToUSCropsAdapter(device)
 
     print("=> creating model '{}'".format(args.model))
-    device = torch.device(args.device)
     model = get_model(args.model, ndims, num_classes, args.sequencelength, device)
 
-    if args.model in ['RF', 'rf']:
-        if args.suffix:
-            logdir = Path(args.logdir) / (f'T_RF_R{args.num}_{args.rc_str}_{args.year}_Seed{args.seed}_{args.suffix}')
-        else:
-            logdir = Path(args.logdir) / (f'T_RF_R{args.num}_{args.rc_str}_{args.year}_Seed{args.seed}')
-        logdir.mkdir(exist_ok=True, parents=True)
-        best_model_path = logdir / 'model_best.joblib'
-        if not args.eval:
-            print('training Random Forest...')
-            model.fit(X_train, y_train)
-            print(f"saving model to {str(best_model_path)}\n")
-            dump(model, best_model_path)
-
-        print('Restoring best model weights for testing...')
-        model = load(best_model_path)
-
-        y_pred = model.predict(X_test)
-        scores = accuracy(y_test, y_pred, args.nclasses + 1)
-
-        scores_msg = ", ".join(
-            [f"{k}={v:.4f}" for (k, v) in scores.items() if k not in ['class_f1', 'confusion_matrix']])
-        print(f"Test results : \n\n {scores_msg} \n\n")
-
-        scores['epoch'] = 'test'
-        conf_mat = scores.pop('confusion_matrix')
-        class_f1 = scores.pop('class_f1')
-
-        log_df = pd.DataFrame([scores]).set_index("epoch")
-        log_df.to_csv(logdir / f"testlog.csv")
-        np.save(logdir / f"test_conf_mat.npy", conf_mat)
-        np.save(logdir / f"test_class_f1.npy", class_f1)
-
-        return logdir
 
     print(f"Initialized {model.modelname}: Total trainable parameters: {get_ntrainparams(model)}")
     model.apply(weight_init)
@@ -301,12 +500,9 @@ def train(args):
                 param.requires_grad = False
 
     if finetune:
-        model.modelname = f'F_{path.parts[-2].split("_")[1][:2]}_{model.modelname}_R{args.num}_{args.rc_str}_{args.year}_Seed{args.seed}'
-    elif args.useall:
-        model.modelname = f'T_{model.modelname}_{args.rc_str}_{args.year}'
+        model.modelname = f'F_{path.parts[-2].split("_")[1][:2]}_{model.modelname}_PM{args.num_pixels}_SL{args.seq_length}_{args.rc_str}'
     else:
-        model.modelname = f'T_{model.modelname}_R{args.num}_{args.rc_str}_{args.year}_Seed{args.seed}'
-
+        model.modelname = f'T_{model.modelname}_PM{args.num_pixels}_SL{args.seq_length}_{args.rc_str}'
     if args.suffix:
         model.modelname += f'_{args.suffix}'
 
@@ -335,8 +531,10 @@ def train(args):
 
             if args.schedule is not None:
                 adjust_learning_rate(optimizer, epoch, args)
-            train_loss = train_epoch(model, optimizer, criterion, traindataloader, device, args)
-            val_loss, scores = test_epoch(model, criterion, valdataloader, device, args)
+            train_loss = train_epoch_with_adapter(model, optimizer, criterion, source_loader_dict, train_adapter,
+                                                  device, args)
+            val_loss, scores = test_epoch_with_adapter(model, criterion, val_loader_dict, val_adapter, device, args)
+
             scores_msg = ", ".join(
                 [f"{k}={v:.4f}" for (k, v) in scores.items() if k not in ['class_f1', 'confusion_matrix']])
             print(f"epoch {epoch + 1}: trainloss={train_loss:.4f}, valloss={val_loss:.4f} " + scores_msg)
@@ -372,7 +570,7 @@ def train(args):
     torch.save({'model_state': state_dict, 'criterion': criterion}, best_model_path)
     model.load_state_dict(state_dict)
 
-    test_loss, scores = test_epoch(model, criterion, testdataloader, device, args)
+    test_loss, scores = test_epoch_with_adapter(model, criterion, test_loader_dict, test_adapter, device, args)
     scores_msg = ", ".join(
         [f"{k}={v:.4f}" for (k, v) in scores.items() if k not in ['class_f1', 'confusion_matrix']])
     print(f"Test results: \n\n {scores_msg}")
