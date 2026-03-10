@@ -61,36 +61,22 @@ class TimeMatchToUSCropsAdapter:
         # 假设 DataLoader 传来的 label 已经是最终需要的形式
         y_flat = pixel_labels.reshape(-1).long()
 
+        has_valid_time = valid_flat.any(dim=1)  # (B*N,)
 
-        # 【检查点 A】数据中是否有 NaN/Inf?
-        if torch.isnan(data_flat).any() or torch.isinf(data_flat).any():
-            print("⚠️ WARNING: Input data contains NaN or Inf! Replacing with 0.")
-            data_flat = torch.nan_to_num(data_flat, nan=0.0, posinf=0.0, neginf=0.0)
+        # 将没有有效时间步的像素标签设为 -1 (Ignore Index)
+        # 注意：CrossEntropyLoss 默认 ignore_index=-100，需确认您的设置
+        IGNORE_INDEX = -100
+        y_flat = y_flat.float()  # 先转 float 方便赋值，或者直接用 torch.where
+        y_flat = torch.where(has_valid_time, y_flat, torch.tensor(IGNORE_INDEX, dtype=y_flat.dtype))
+        y_flat = y_flat.long()
 
-        # 【检查点 B】标签合法性检查
-        # 有效标签范围: [0, num_classes - 1]
-        # 任何 < 0 或 >= num_classes 的标签都必须设为 ignore_index (-100)
-
-        # 创建掩码：标签不合法的样本
-        invalid_label_mask = (y_flat < 0) | (y_flat >= 12)
-
-        if invalid_label_mask.any():
-            count_invalid = invalid_label_mask.sum().item()
-            # 只在第一次打印，避免刷屏
-            if not hasattr(self, 'warned_invalid'):
-                print(
-                    f"⚠️ WARNING: Found {count_invalid} pixels with INVALID labels (out of range [0, {self.num_classes - 1}]). Setting to ignore_index (-100).")
-                print(f"   Unique invalid labels found: {torch.unique(y_flat[invalid_label_mask])}")
-                self.warned_invalid = True
-
-        # 3. 构建输入元组
+        # 3. 构建 Tuple
         X_tuple = (
             data_flat,
             mask_flat,
             doy_flat,
-            valid_flat.float()
+            valid_flat.float()  # weight
         )
-
         # 4. 统一移动到设备 (GPU)
         if self.device is not None:
             X_tuple = tuple(t.to(self.device) if torch.is_tensor(t) else t for t in X_tuple)
@@ -161,8 +147,8 @@ def test_epoch_with_adapter(model, criterion, dict_dataloader, adapter, device, 
                 if y.device != device:
                     y = y.to(device)
 
-                if y[y!=6].sum().item() > 0:
-                    print(y)
+                # if y[y!=6].sum().item() > 0:
+                #     print(y)
                 if args.use_doy:
                     logits = model(X, use_doy=True)
                 else:
@@ -175,8 +161,14 @@ def test_epoch_with_adapter(model, criterion, dict_dataloader, adapter, device, 
                 iterator.set_description(f"test loss={loss:.2f}")
                 losses.update(loss.item(), y.size(0))
 
-                y_true_list.append(y.cpu())
-                y_pred_list.append(out.argmax(-1).cpu())
+                pred = out.argmax(-1).cpu()
+                true = y.cpu()
+
+                # 创建掩码：只保留标签 >= 0 的样本
+                valid_mask = true >= 0
+
+                y_true_list.append(true[valid_mask])
+                y_pred_list.append(pred[valid_mask])
 
     if len(y_true_list) == 0:
         return losses.avg, {}  # 防止空列表报错
@@ -454,7 +446,7 @@ def train(args):
     best_model_path = logdir / 'model_best.pth'
     print(f"Logging results to {logdir}")
 
-    criterion = torch.nn.CrossEntropyLoss(reduction="mean")
+    criterion = torch.nn.CrossEntropyLoss(reduction="mean",ignore_index=-100)
     parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     optimizer = torch.optim.Adam(parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
 
