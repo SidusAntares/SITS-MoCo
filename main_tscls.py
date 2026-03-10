@@ -33,148 +33,47 @@ import torch
 
 
 class TimeMatchToUSCropsAdapter:
-    """
-    将 PixelSetData 的输出转换为 STNet (USCrops 格式) 可接受的输入
-    """
-
     def __init__(self, device):
         self.device = device
 
     def __call__(self, batch_dict):
-        """
-        输入: batch_dict (来自 PixelSetData loader)
-        输出: (X_tuple, y_tensor) 符合 STNet 训练循环的格式
-        """
-        pixels = batch_dict['pixels']  # (B, T, C, N)
-        positions = batch_dict['positions']  # (B, T)
-        valid_pixels = batch_dict['valid_pixels']  # (B, T, N)
-        pixel_labels = batch_dict['pixel_labels']  # (B, N)
+        pixels = batch_dict['pixels']
+        positions = batch_dict['positions']
+        valid_pixels = batch_dict['valid_pixels']
+        pixel_labels = batch_dict['pixel_labels']
 
         B, T, C, N = pixels.shape
 
-        # 1. 展平像素维度: (B, T, C, N) -> (B*N, T, C)
+        # 1. 展平 (此时还在 CPU)
         data_flat = pixels.permute(0, 3, 1, 2).reshape(-1, T, C)
-
-        # 2. 扩展其他维度以匹配展平后的数据
-        # positions: (B, T) -> (B, 1, T) -> (B, N, T) -> (B*N, T)
         doy_flat = positions.unsqueeze(1).expand(-1, N, -1).reshape(-1, T)
 
-        # mask: 这里 UScrops 的 mask 是基于 padding 的。
-        # PixelSetData 的 valid_pixels 指示哪些是真实像素。
-        # 我们需要构造一个全 1 的 mask (表示无 padding)，或者根据 valid_pixels 构造
-        # 假设 RandomSampleTimeSteps 已经保证了时间长度固定，这里主要关注有效像素
-        # 为了模拟 UScrops 的 mask (True=padding)，我们取反 valid_pixels (False=valid)
-        # 注意：UScrops mask shape is (B*N, T).
-        # 如果 valid_pixels 是 float (1.0/0.0)，转为 bool
         valid_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T).bool()
-        mask_flat = ~valid_flat  # True where invalid/padding
+        mask_flat = ~valid_flat
 
-        # weight: 同样展平
-        weight_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T).float()
-        # 归一化权重 (可选，视模型需求)
-        # weight_flat = weight_flat / (weight_flat.sum(dim=1, keepdim=True) + 1e-9)
-
-        # 3. 处理标签: (B, N) -> (B*N,)
+        # 2. 处理标签
         y_flat = pixel_labels.reshape(-1)
+        has_valid_time = valid_flat.any(dim=1)
 
-        # 4. 构建 STNet 需要的 Tuple
-        # 顺序必须严格对应 USCrops.transform 的返回: (data, mask, doy, weight)
+        IGNORE_INDEX = -100
+        # 确保 IGNORE_INDEX 张量也在 CPU 上先创建，稍后一起移动
+        y_flat = torch.where(has_valid_time, y_flat, torch.tensor(IGNORE_INDEX, dtype=y_flat.dtype))
+        y_flat = y_flat.long()
+
+        # 3. 构建 Tuple (此时全在 CPU)
         X_tuple = (
-            data_flat.to(self.device),
-            mask_flat.to(self.device),
-            doy_flat.to(self.device),
-            weight_flat.to(self.device)
+            data_flat,
+            mask_flat,
+            doy_flat,
+            valid_flat.float()
         )
 
-        y_tensor = y_flat.to(self.device)
+        # 【关键修复】将所有数据移动到指定设备 (GPU)
+        if self.device is not None:
+            X_tuple = tuple(t.to(self.device) if torch.is_tensor(t) else t for t in X_tuple)
+            y_flat = y_flat.to(self.device)
 
-        return X_tuple, y_tensor
-
-    def train_epoch_with_adapter(model, optimizer, criterion, dict_dataloader, adapter, device, args):
-        """
-        专门用于处理 PixelSetData (Dict 格式) 的训练循环
-        """
-        losses = AverageMeter('Loss', ':.4e')
-        model.train()
-
-        with tqdm(enumerate(dict_dataloader), total=len(dict_dataloader), leave=True) as iterator:
-            for idx, batch_dict in iterator:
-                # 【核心步骤】使用 Adapter 将 Dict 转换为 (X_tuple, y)
-                try:
-                    X, y = adapter(batch_dict)
-                except Exception as e:
-                    print(f"Error adapting batch {idx}: {e}")
-                    continue
-
-                # 此时 X 已经是 tuple, y 是 tensor，且都在 device 上 (Adapter 内部处理了 to(device))
-                # 不需要再调用 recursive_todevice(X, device)，因为 Adapter 已经做了
-                # 但为了保险，如果 Adapter 没做全，可以保留 y 的 check
-                if y.device != device:
-                    y = y.to(device)
-
-                optimizer.zero_grad()
-
-                # 调用模型
-                if args.use_doy:
-                    logits = model(X, use_doy=True)
-                else:
-                    logits = model(X)
-
-                out = F.log_softmax(logits, dim=-1)
-                loss = criterion(out, y)
-
-                loss.backward()
-                optimizer.step()
-
-                iterator.set_description(f"train loss={loss:.2f}")
-                losses.update(loss.item(), y.size(0))
-
-        return losses.avg
-
-    def test_epoch_with_adapter(model, criterion, dict_dataloader, adapter, device, args):
-        """
-        专门用于处理 PixelSetData (Dict 格式) 的验证/测试循环
-        """
-        losses = AverageMeter('Loss', ':.4e')
-        model.eval()
-        y_true_list = list()
-        y_pred_list = list()
-
-        with torch.no_grad():
-            with tqdm(enumerate(dict_dataloader), total=len(dict_dataloader), leave=True) as iterator:
-                for idx, batch_dict in iterator:
-                    # 【核心步骤】转换数据
-                    try:
-                        X, y = adapter(batch_dict)
-                    except Exception as e:
-                        continue
-
-                    if y.device != device:
-                        y = y.to(device)
-
-                    if args.use_doy:
-                        logits = model(X, use_doy=True)
-                    else:
-                        logits = model(X)
-
-                    out = F.log_softmax(logits, dim=-1)
-                    loss = criterion(out, y)
-
-                    iterator.set_description(f"test loss={loss:.2f}")
-                    losses.update(loss.item(), y.size(0))
-
-                    y_true_list.append(y.cpu())
-                    y_pred_list.append(out.argmax(-1).cpu())
-
-        if len(y_true_list) == 0:
-            return losses.avg, {}  # 防止空列表报错
-
-        y_true = torch.cat(y_true_list).numpy()
-        y_pred = torch.cat(y_pred_list).numpy()
-
-        scores = accuracy(y_true, y_pred, args.nclasses + 1)
-        return losses.avg, scores
-
+        return X_tuple, y_flat
 
 def train_epoch_with_adapter(model, optimizer, criterion, dict_dataloader, adapter, device, args):
     """
@@ -238,6 +137,13 @@ def test_epoch_with_adapter(model, criterion, dict_dataloader, adapter, device, 
 
                 if y.device != device:
                     y = y.to(device)
+                # 在 logits = model(X, ...) 之前加入
+                if idx == 0:  # 只打印第一个 batch
+                    data, mask, doy, weight = X
+                    print(f"\n--- Debug Batch Info ---")
+                    print(f"Data shape: {data.shape}, Min: {data.min()}, Max: {data.max()}, Mean: {data.mean()}")
+                    print(f"Mask shape: {mask.shape}, True count (padding): {mask.sum()}")
+                    print(f"Labels (first 10): {y[:10]}")
 
                 if args.use_doy:
                     logits = model(X, use_doy=True)
@@ -280,7 +186,7 @@ def parse_args():
                         help='num of classes (default: 20)')
     parser.add_argument('--year', type=int, default=2019,
                         help='year of dataset')
-    parser.add_argument('-seq', '--sequencelength', type=int, default=70,
+    parser.add_argument('-seq', '--sequencelength', type=int, default=30,
                         help='Maximum length of time series data (default 70)')
     parser.add_argument('-j', '--workers', type=int, default=0,
                         help='number of CPU workers to load the next batch')
@@ -364,6 +270,7 @@ def parse_args():
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 # ================== put a patch ===============
     args.workers = args.num_workers
+    args.num = args.num_pixels
 # ==============================================
 
     return args
@@ -458,6 +365,7 @@ def train(args):
     source_loader_dict = get_data_loaders(splits, config, config.balance_source)
 
     num_classes = cfg.num_classes
+    args.nclasses = cfg.num_classes
     assert args.model not in ['rf', 'RF'] # 这两种模型的数据加载方式要求numpy数组
     ndims = 10
 
@@ -500,11 +408,11 @@ def train(args):
                 param.requires_grad = False
 
     if finetune:
-        model.modelname = f'F_{path.parts[-2].split("_")[1][:2]}_{model.modelname}_PM{args.num_pixels}_SL{args.seq_length}_{args.rc_str}'
+        model.modelname = f'F_{path.parts[-2].split("_")[1][:2]}_{model.modelname}_R{args.num}_{args.rc_str}_{args.year}_Seed{args.seed}'
+    elif args.useall:
+        model.modelname = f'T_{model.modelname}_{args.rc_str}_{args.year}'
     else:
-        model.modelname = f'T_{model.modelname}_PM{args.num_pixels}_SL{args.seq_length}_{args.rc_str}'
-    if args.suffix:
-        model.modelname += f'_{args.suffix}'
+        model.modelname = f'T_{model.modelname}_R{args.num}_{args.rc_str}_{args.year}_Seed{args.seed}'
 
     logdir = Path(args.logdir) / model.modelname
     logdir.mkdir(parents=True, exist_ok=True)
@@ -563,12 +471,12 @@ def train(args):
             print(f"\n{args.epochs} epochs training finished.")
 
     # test
-    print('Restoring best model weights for testing...')
-    checkpoint = torch.load(best_model_path)
-    state_dict = {k: v for k, v in checkpoint['model_state'].items()}
-    criterion = checkpoint['criterion']
-    torch.save({'model_state': state_dict, 'criterion': criterion}, best_model_path)
-    model.load_state_dict(state_dict)
+    # print('Restoring best model weights for testing...')
+    # checkpoint = torch.load(best_model_path)
+    # state_dict = {k: v for k, v in checkpoint['model_state'].items()}
+    # criterion = checkpoint['criterion']
+    # torch.save({'model_state': state_dict, 'criterion': criterion}, best_model_path)
+    # model.load_state_dict(state_dict)
 
     test_loss, scores = test_epoch_with_adapter(model, criterion, test_loader_dict, test_adapter, device, args)
     scores_msg = ", ".join(

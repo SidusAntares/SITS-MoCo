@@ -12,6 +12,7 @@ import moco.loader
 import moco.builder
 from datasets import *
 from models import *
+import numpy as np
 
 
 # -------------------------- #
