@@ -44,23 +44,46 @@ class TimeMatchToUSCropsAdapter:
 
         B, T, C, N = pixels.shape
 
-        # 1. 展平 (此时还在 CPU)
+        # 1. 展平 (保持 CPU 操作以节省显存)
+        # data: (B*N, T, C)
         data_flat = pixels.permute(0, 3, 1, 2).reshape(-1, T, C)
+
+        # doy: (B*N, T)
         doy_flat = positions.unsqueeze(1).expand(-1, N, -1).reshape(-1, T)
 
+        # mask: (B*N, T), True 表示 Padding/无效
         valid_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T).bool()
         mask_flat = ~valid_flat
 
-        # 2. 处理标签
-        y_flat = pixel_labels.reshape(-1)
-        has_valid_time = valid_flat.any(dim=1)
+        # 2. 标签处理
+        # y: (B*N,)
+        # 不做任何额外的过滤、阈值判断或类别剔除
+        # 假设 DataLoader 传来的 label 已经是最终需要的形式
+        y_flat = pixel_labels.reshape(-1).long()
 
-        IGNORE_INDEX = -100
-        # 确保 IGNORE_INDEX 张量也在 CPU 上先创建，稍后一起移动
-        y_flat = torch.where(has_valid_time, y_flat, torch.tensor(IGNORE_INDEX, dtype=y_flat.dtype))
-        y_flat = y_flat.long()
 
-        # 3. 构建 Tuple (此时全在 CPU)
+        # 【检查点 A】数据中是否有 NaN/Inf?
+        if torch.isnan(data_flat).any() or torch.isinf(data_flat).any():
+            print("⚠️ WARNING: Input data contains NaN or Inf! Replacing with 0.")
+            data_flat = torch.nan_to_num(data_flat, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 【检查点 B】标签合法性检查
+        # 有效标签范围: [0, num_classes - 1]
+        # 任何 < 0 或 >= num_classes 的标签都必须设为 ignore_index (-100)
+
+        # 创建掩码：标签不合法的样本
+        invalid_label_mask = (y_flat < 0) | (y_flat >= 12)
+
+        if invalid_label_mask.any():
+            count_invalid = invalid_label_mask.sum().item()
+            # 只在第一次打印，避免刷屏
+            if not hasattr(self, 'warned_invalid'):
+                print(
+                    f"⚠️ WARNING: Found {count_invalid} pixels with INVALID labels (out of range [0, {self.num_classes - 1}]). Setting to ignore_index (-100).")
+                print(f"   Unique invalid labels found: {torch.unique(y_flat[invalid_label_mask])}")
+                self.warned_invalid = True
+
+        # 3. 构建输入元组
         X_tuple = (
             data_flat,
             mask_flat,
@@ -68,7 +91,7 @@ class TimeMatchToUSCropsAdapter:
             valid_flat.float()
         )
 
-        # 【关键修复】将所有数据移动到指定设备 (GPU)
+        # 4. 统一移动到设备 (GPU)
         if self.device is not None:
             X_tuple = tuple(t.to(self.device) if torch.is_tensor(t) else t for t in X_tuple)
             y_flat = y_flat.to(self.device)
@@ -165,7 +188,12 @@ def test_epoch_with_adapter(model, criterion, dict_dataloader, adapter, device, 
     y_true = torch.cat(y_true_list).numpy()
     y_pred = torch.cat(y_pred_list).numpy()
 
-    scores = accuracy(y_true, y_pred, args.nclasses + 1)
+    # 3. 调用 accuracy 函数
+    # 传入过滤后的数据
+    # num_classes 传入 args.nclasses (即 12)，因为有效标签范围是 0-11
+    # 原代码传的是 args.nclasses + 1，如果您的类别确实是 0-11，传 12 即可生成 12x12 矩阵
+    # 如果原代码逻辑依赖 +1 (比如为了兼容某些特定索引)，请保持原样，但数据必须无负数
+    scores = accuracy(y_pred, y_true, args.nclasses)
     return losses.avg, scores
 
 def parse_args():
@@ -366,6 +394,7 @@ def train(args):
 
     num_classes = cfg.num_classes
     args.nclasses = cfg.num_classes
+    print("==========>number of classes", num_classes)
     assert args.model not in ['rf', 'RF'] # 这两种模型的数据加载方式要求numpy数组
     ndims = 10
 
