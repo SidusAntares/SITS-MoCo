@@ -30,6 +30,9 @@ class PixelSetData(data.Dataset):
         transform=None,
         indices=None,
         with_extra=False,
+        useall=True,
+        num=3000,
+        seed=111,
     ):
         super(PixelSetData, self).__init__()
 
@@ -42,16 +45,25 @@ class PixelSetData(data.Dataset):
         self.transform = transform
         self.with_extra = with_extra
 
+        # 保存新参数供调试或后续使用
+        self.useall = useall
+        self.num = num
+        self.seed = seed
+
         self.classes = classes
         self.class_to_idx = {cls: idx for idx, cls in enumerate(classes)}
 
         self.samples, self.metadata = self.make_dataset(
-            self.data_folder, self.meta_folder, self.class_to_idx, indices, self.country
+            self.data_folder, self.meta_folder, self.class_to_idx, indices, self.country,
+            useall=useall,
+            num=num,
+            seed=seed
         )
 
         self.dates = self.metadata["dates"]
         self.date_positions = self.days_after(self.metadata["start_date"], self.dates)
         self.date_indices = np.arange(len(self.date_positions))
+
 
     def get_shapes(self):
         return [
@@ -84,8 +96,49 @@ class PixelSetData(data.Dataset):
 
         return sample
 
-    def make_dataset(self, data_folder, meta_folder, class_to_idx, indices, country):
+    def make_dataset(self, data_folder, meta_folder, class_to_idx, indices, country,useall=True, num=3000, seed=111):
         metadata = pkl.load(open(os.path.join(meta_folder, "metadata.pkl"), "rb"))
+        total_parcels_count = len(metadata["parcels"])
+
+        # ---------------- 核心采样逻辑开始 ----------------
+        target_indices = None
+
+        # 优先级 1: 外部传入了具体的 indices (例如来自 create_train_val_test_folds)
+        if indices is not None:
+            if isinstance(indices, set):
+                indices = sorted(list(indices))
+            elif isinstance(indices, np.ndarray):
+                indices = indices.tolist()
+
+            # 过滤掉可能越界的索引 (防御性编程)
+            valid_indices = [i for i in indices if i < total_parcels_count]
+            if len(valid_indices) != len(indices):
+                print(
+                    f"Warning: {len(indices) - len(valid_indices)} indices were out of range. Using {len(valid_indices)} valid samples.")
+
+            target_indices = valid_indices
+            print(f"[{self.dataset_name}] Using provided indices subset: {len(target_indices)} samples.")
+
+        # 优先级 2: 未传入 indices，且 useall=False -> 执行随机采样 (复刻 USCrops 行为)
+        elif not useall:
+            if num >= total_parcels_count:
+                print(f"[{self.dataset_name}] Requested num ({num}) >= Total ({total_parcels_count}). Using all data.")
+                target_indices = list(range(total_parcels_count))
+            else:
+                # 🔑 关键：使用固定种子进行确定性随机打乱
+                rng = np.random.RandomState(seed)
+                all_indices = list(range(total_parcels_count))
+                rng.shuffle(all_indices)
+                target_indices = all_indices[:num]
+                print(f"[{self.dataset_name}] Randomly sampled {num} parcels from {total_parcels_count} (Seed={seed}).")
+
+        # 优先级 3: 使用全量数据
+        else:
+            target_indices = list(range(total_parcels_count))
+            if not useall:  # 这种情况理论上不会发生，因为上面 num>=total 会捕获
+                pass
+
+        # ---------------- 核心采样逻辑结束 ----------------
 
         instances = []
         new_parcel_metadata = []
@@ -94,7 +147,9 @@ class PixelSetData(data.Dataset):
 
         unknown_crop_codes = set()
 
-        for parcel_idx, parcel in enumerate(metadata["parcels"]):
+        # 👇 只遍历选定的 target_indices
+        for parcel_idx in target_indices:
+            parcel = metadata["parcels"][parcel_idx]
             if indices is not None:
                 if not parcel_idx in indices:
                     continue

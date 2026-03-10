@@ -160,19 +160,15 @@ def test_epoch_with_adapter(model, criterion, dict_dataloader, adapter, device, 
 
                 if y.device != device:
                     y = y.to(device)
-                # 在 logits = model(X, ...) 之前加入
-                if idx == 0:  # 只打印第一个 batch
-                    data, mask, doy, weight = X
-                    print(f"\n--- Debug Batch Info ---")
-                    print(f"Data shape: {data.shape}, Min: {data.min()}, Max: {data.max()}, Mean: {data.mean()}")
-                    print(f"Mask shape: {mask.shape}, True count (padding): {mask.sum()}")
-                    print(f"Labels (first 10): {y[:10]}")
 
+                if y[y!=6].sum().item() > 0:
+                    print(y)
                 if args.use_doy:
                     logits = model(X, use_doy=True)
                 else:
                     logits = model(X)
 
+                # 这里可能有问题，train函数同
                 out = F.log_softmax(logits, dim=-1)
                 loss = criterion(out, y)
 
@@ -251,7 +247,7 @@ def parse_args():
     )
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--balance_source", type=bool_flag, default=True, help='class balanced batches for source')
-    parser.add_argument('--num_pixels', default=4096, type=int, help='Number of pixels to sample from the input sample')
+    parser.add_argument('--num_pixels', default=100, type=int, help='Number of pixels to sample from the input sample')
     parser.add_argument('--seq_length', default=30, type=int,
                         help='Number of time steps to sample from the input sample')
     # 数据路径与域
@@ -298,7 +294,6 @@ def parse_args():
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
 # ================== put a patch ===============
     args.workers = args.num_workers
-    args.num = args.num_pixels
 # ==============================================
 
     return args
@@ -378,13 +373,24 @@ def train(args):
     source_classes = label_utils.get_classes(cfg.source.split('/')[0],
                                              combine_spring_and_winter=cfg.combine_spring_and_winter)
     source_data = PixelSetData(cfg.data_root, cfg.source, source_classes)
+    target_data = PixelSetData(cfg.data_root, cfg.target, source_classes)
     labels, counts = np.unique(source_data.get_labels(), return_counts=True)
     source_classes = [source_classes[i] for i in labels[counts >= 200]]
     print('Using classes:', source_classes)
     cfg.classes = source_classes
     cfg.num_classes = len(source_classes)  # 可以覆盖该参数的默认设置
+
+    # 控制微调样本量
+    total_num = len(target_data)  # 获取全量长度
+    if args.useall or args.num >= total_num:
+        use_num = total_num
+        print(f"Using all {total_num} samples.")
+    else:
+        use_num = args.num
+        print(f"⚠️ Limiting experiment pool to {use_num} random samples (Seed={args.seed}).")
+
     # Randomly assign parcels to train/val/test
-    indices = {config.source: len(source_data)}
+    indices = {config.target: use_num}
     folds = create_train_val_test_folds([config.target], config.num_folds, indices, config.val_ratio,
                                         config.test_ratio)
     splits = folds[0]
@@ -500,12 +506,12 @@ def train(args):
             print(f"\n{args.epochs} epochs training finished.")
 
     # test
-    # print('Restoring best model weights for testing...')
-    # checkpoint = torch.load(best_model_path)
-    # state_dict = {k: v for k, v in checkpoint['model_state'].items()}
-    # criterion = checkpoint['criterion']
-    # torch.save({'model_state': state_dict, 'criterion': criterion}, best_model_path)
-    # model.load_state_dict(state_dict)
+    print('Restoring best model weights for testing...')
+    checkpoint = torch.load(best_model_path)
+    state_dict = {k: v for k, v in checkpoint['model_state'].items()}
+    criterion = checkpoint['criterion']
+    torch.save({'model_state': state_dict, 'criterion': criterion}, best_model_path)
+    model.load_state_dict(state_dict)
 
     test_loss, scores = test_epoch_with_adapter(model, criterion, test_loader_dict, test_adapter, device, args)
     scores_msg = ", ".join(
