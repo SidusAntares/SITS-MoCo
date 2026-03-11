@@ -234,11 +234,11 @@ def parse_args():
                         help='Maximum length of time series data (default 70)')
     parser.add_argument('-j', '--workers', type=int, default=0,
                         help='number of CPU workers to load the next batch')
-    parser.add_argument('-e', '--epochs', type=int, default=100,
+    parser.add_argument('-e', '--epochs', type=int, default=50,
                         help='number of training epochs')
-    parser.add_argument('-b', '--batchsize', type=int, default=512,
+    parser.add_argument('-b', '--batchsize', type=int, default=500,
                         help='batch size (number of time series processed simultaneously)')
-    parser.add_argument('-lr', '--learning-rate', type=float, default=1e-5,
+    parser.add_argument('-lr', '--learning-rate', type=float, default=1e-3,
                         help='optimizer learning rate (default 1e-3)')
     parser.add_argument('--weight-decay', type=float, default=1e-4,
                         help='optimizer weight_decay (default 1e-4)')
@@ -261,7 +261,7 @@ def parse_args():
     parser.add_argument('--freeze', action='store_true',
                         help='freeze pretrain model')
 
-    parser.add_argument('-n', '--num', default=3000, type=int,
+    parser.add_argument('-n', '--num', default=10000, type=int,
                         help='number of labeled samples (training and validation) (default 3000)')
 
     # 以下都是timematch
@@ -270,9 +270,9 @@ def parse_args():
     parser.add_argument(
         "--num_workers", default=8, type=int, help="Number of workers"
     )
-    parser.add_argument("--batch_size", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=500)
     parser.add_argument("--balance_source", type=bool_flag, default=True, help='class balanced batches for source')
-    parser.add_argument('--num_pixels', default=100, type=int, help='Number of pixels to sample from the input sample')
+    parser.add_argument('--num_pixels', default=50, type=int, help='Number of pixels to sample from the input sample')
     parser.add_argument('--seq_length', default=30, type=int,
                         help='Number of time steps to sample from the input sample')
     # 数据路径与域
@@ -280,8 +280,8 @@ def parse_args():
                         help='Path to datasets root directory')
     # parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str,
     #                     help='Path to datasets root directory')
-    parser.add_argument('--source', default='france/30TXT/2017', type=str)
-    # parser.add_argument('--target', default='france/31TCJ/2017', type=str)
+    parser.add_argument('--source', default='denmark/32VNH/2017', type=str)
+    # parser.add_argument('--target', default='france/31TCJ/2017', type=str) denmark/32VNH/2017 austria/33UVP/2017 france/30TXT/2017
     # 类别处理
     parser.add_argument('--combine_spring_and_winter', action='store_true')
     # 数据划分
