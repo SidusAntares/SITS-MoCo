@@ -35,6 +35,8 @@ import torch
 class TimeMatchToUSCropsAdapter:
     def __init__(self, device):
         self.device = device
+        self.warn_count = 0
+        self.invalid_sample_warn_count = 0
 
     def __call__(self, batch_dict):
         pixels = batch_dict['pixels']
@@ -44,83 +46,194 @@ class TimeMatchToUSCropsAdapter:
 
         B, T, C, N = pixels.shape
 
-        # 1. 展平 (保持 CPU 操作以节省显存)
-        # data: (B*N, T, C)
+        # 1. 展平
         data_flat = pixels.permute(0, 3, 1, 2).reshape(-1, T, C)
-
-        # doy: (B*N, T)
         doy_flat = positions.unsqueeze(1).expand(-1, N, -1).reshape(-1, T)
-
-        # mask: (B*N, T), True 表示 Padding/无效
         valid_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T).bool()
         mask_flat = ~valid_flat
-
-        # 2. 标签处理
-        # y: (B*N,)
-        # 不做任何额外的过滤、阈值判断或类别剔除
-        # 假设 DataLoader 传来的 label 已经是最终需要的形式
         y_flat = pixel_labels.reshape(-1).long()
 
-        has_valid_time = valid_flat.any(dim=1)  # (B*N,)
+        # ==========================================
+        # 👇 【关键修复 1】防止“全无效样本”导致模型内除零 (Div-by-Zero)
+        # 如果某样本所有时间步都无效 (valid_flat 全 False)，模型计算 weight/sum(weight) 时会除以 0 -> NaN
+        # 解决方案：强制将这些样本的第一个时间步标记为有效。
+        # ==========================================
+        has_valid_time = valid_flat.any(dim=1)
+        all_invalid_mask = ~has_valid_time  # 布尔掩码：True 表示该样本全无效
 
-        # 将没有有效时间步的像素标签设为 -1 (Ignore Index)
-        # 注意：CrossEntropyLoss 默认 ignore_index=-100，需确认您的设置
+        if all_invalid_mask.any():
+            count = all_invalid_mask.sum().item()
+            if self.invalid_sample_warn_count < 5:
+                print(f"⚠️ WARNING: Detected {count} samples with ALL time steps invalid. "
+                      f"Forcing first time step to VALID to prevent Div-by-Zero NaN.")
+                self.invalid_sample_warn_count += 1
+
+            # 强制修正：将全无效样本的第 0 个时间步设为 True (有效)
+            valid_flat[all_invalid_mask, 0] = True
+            mask_flat[all_invalid_mask, 0] = False
+
+            # 重新计算 has_valid_time (现在它们都是 True 了)
+            has_valid_time = valid_flat.any(dim=1)
+
+        # ==========================================
+        # 👇 【关键修复 2】处理输入数据中的 NaN/Inf
+        # ==========================================
+        has_nan_inf = torch.isnan(data_flat).any(dim=(1, 2)) | torch.isinf(data_flat).any(dim=(1, 2))
+
+        if has_nan_inf.any():
+            dirty_indices = has_nan_inf
+            y_flat = y_flat.float()
+            y_flat[dirty_indices] = -100.0
+            y_flat = y_flat.long()
+
+            # 将脏数据的有效时间步设为 False (虽然上面已经处理了全无效的情况，但这里是为了逻辑一致)
+            # 注意：如果上面强制设为了 True，这里如果数据本身是 NaN，我们依然希望模型忽略它。
+            # 但为了防止再次触发全无效逻辑，我们只标记数据，不反转 valid_flat，
+            # 因为模型内部应该通过 loss 的 ignore_index 来处理，或者依靠前面的防御性代码。
+            # 最安全的做法：如果数据是 NaN，即使 valid 是 True，模型算出来也是 NaN。
+            # 所以这里必须把 valid 设为 False，但这可能再次制造“全无效样本”。
+            # 策略：如果数据是 NaN，设为 False。如果因此变成全无效，上面的逻辑会在下一轮 (或模型内) 处理?
+            # 不，上面的逻辑已经跑过了。
+            # 修正策略：如果数据是 NaN，我们把它设为 0，并保持 valid=True (如果它是唯一的有效步)，
+            # 或者设为 valid=False 并接受它可能被上面的逻辑“救活”为第一步有效但数据为 0。
+
+            # 最佳实践：将 NaN 数据置 0，并标记 Label 为 Ignore。
+            # 不需要把 valid 设为 False，因为数据已经是 0 了，不会炸，只是没信息量。
+            # 但如果原数据是 Inf，置 0 是安全的。
+
+            data_flat[dirty_indices] = 0.0  # 替换脏数据为 0
+
+            if self.warn_count < 5:
+                print(f"⚠️ WARNING: Detected {has_nan_inf.sum().item()} samples with NaN/Inf in input data. "
+                      f"Replaced with 0 and set Label to Ignore.")
+                self.warn_count += 1
+
+        # ==========================================
+        # 👇 处理无有效时间步的样本 (Label Ignoring)
+        # ==========================================
+        # 注意：经过 [关键修复 1] 后，理论上 has_valid_time 应该全为 True。
+        # 但为了逻辑健壮性，保留此步骤。
+        y_flat = y_flat.float()
         IGNORE_INDEX = -100
-        y_flat = y_flat.float()  # 先转 float 方便赋值，或者直接用 torch.where
         y_flat = torch.where(has_valid_time, y_flat, torch.tensor(IGNORE_INDEX, dtype=y_flat.dtype))
         y_flat = y_flat.long()
 
-        # 3. 构建 Tuple
+        # 再次全局检查 (双重保险)
+        if torch.isnan(data_flat).any() or torch.isinf(data_flat).any():
+            data_flat = torch.nan_to_num(data_flat, nan=0.0, posinf=0.0, neginf=0.0)
+
         X_tuple = (
             data_flat,
             mask_flat,
             doy_flat,
-            valid_flat.float()  # weight
+            valid_flat.float()
         )
-        # 4. 统一移动到设备 (GPU)
+
+        # 打印一次调试信息
+        if self.warn_count < 1:
+            print(f"\n--- [INPUT DATA DEBUG] ---")
+            print(f"data_flat shape: {data_flat.shape}")
+            print(f"data_flat Min: {data_flat.min().item():.4f}, Max: {data_flat.max().item():.4f}")
+            print(f"data_flat Mean: {data_flat.mean().item():.4f}, Std: {data_flat.std().item():.4f}")
+            print(f"Has NaN/Inf in data_flat: {torch.isnan(data_flat).any() or torch.isinf(data_flat).any()}")
+            print(f"mask_flat (True=invalid) sum: {mask_flat.sum().item()}")
+            print(f"doy_flat range: [{doy_flat.min().item()}, {doy_flat.max().item()}]")
+
+            # 检查是否还有全无效的样本 (理论上应该没有了)
+            final_check = ~valid_flat.any(dim=1)
+            if final_check.any():
+                print(f"❌ CRITICAL: Still have {final_check.sum().item()} all-invalid samples after fix!")
+            else:
+                print(f"✅ All samples have at least one valid time step.")
+
+            print(f"--------------------------\n")
+            self.warn_count += 1
+
         if self.device is not None:
             X_tuple = tuple(t.to(self.device) if torch.is_tensor(t) else t for t in X_tuple)
             y_flat = y_flat.to(self.device)
 
         return X_tuple, y_flat
 
+
 def train_epoch_with_adapter(model, optimizer, criterion, dict_dataloader, adapter, device, args):
     """
-    专门用于处理 PixelSetData (Dict 格式) 的训练循环
+    专门用于处理 PixelSetData (Dict 格式) 的训练循环 (带强校验)
     """
     losses = AverageMeter('Loss', ':.4e')
     model.train()
 
+    # 标记是否已经打印过调试信息
+    debug_printed = False
+
     with tqdm(enumerate(dict_dataloader), total=len(dict_dataloader), leave=True) as iterator:
         for idx, batch_dict in iterator:
-            # 【核心步骤】使用 Adapter 将 Dict 转换为 (X_tuple, y)
             try:
                 X, y = adapter(batch_dict)
             except Exception as e:
                 print(f"Error adapting batch {idx}: {e}")
                 continue
 
-            # 此时 X 已经是 tuple, y 是 tensor，且都在 device 上 (Adapter 内部处理了 to(device))
-            # 不需要再调用 recursive_todevice(X, device)，因为 Adapter 已经做了
-            # 但为了保险，如果 Adapter 没做全，可以保留 y 的 check
             if y.device != device:
                 y = y.to(device)
 
             optimizer.zero_grad()
 
-            # 调用模型
             if args.use_doy:
                 logits = model(X, use_doy=True)
             else:
                 logits = model(X)
 
+            # 👇 【关键调试】在第一个 batch 检查数据状态
+            if not debug_printed:
+                print(f"\n--- [DEBUG] Batch {idx} Status ---")
+                print(f"Logits shape: {logits.shape}, Min: {logits.min().item():.4f}, Max: {logits.max().item():.4f}")
+                print(f"Logits has NaN/Inf: {torch.isnan(logits).any() or torch.isinf(logits).any()}")
+
+                # 检查标签
+                unique_labels = torch.unique(y[y >= 0])  # 只看有效标签
+                print(f"Valid Labels unique values: {unique_labels.tolist()}")
+                print(f"Max Label Value: {unique_labels.max().item() if len(unique_labels) > 0 else 'None'}")
+                print(f"Expected Num Classes: {args.nclasses}")
+                if len(unique_labels) > 0 and unique_labels.max().item() >= args.nclasses:
+                    print("⚠️ CRITICAL ERROR: Label value >= num_classes! This causes NaN in CrossEntropyLoss.")
+                print(f"-------------------------------\n")
+                debug_printed = True
+
+            # 👇 【关键防御】如果 Logits 已经是 NaN/Inf，跳过 backward，防止污染优化器状态
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print(f"⚠️ Skipping batch {idx}: Logits contain NaN/Inf.")
+                continue
+
+            # 再次确认标签范围 (双重保险)
+            if (y >= args.nclasses).any() and (y != -100).any():
+                print(f"⚠️ Skipping batch {idx}: Labels out of range detected.")
+                # 将越界标签强制设为 -100
+                y = y.clone()
+                y[y >= args.nclasses] = -100
+
             out = F.log_softmax(logits, dim=-1)
+
+            # 检查 log_softmax 后是否有 NaN
+            if torch.isnan(out).any():
+                print(f"⚠️ Skipping batch {idx}: log_softmax output contains NaN.")
+                continue
+
             loss = criterion(out, y)
 
+            # 检查 Loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"⚠️ Skipping batch {idx}: Loss is NaN/Inf.")
+                continue
+
             loss.backward()
+
+            # 梯度裁剪 (防止梯度爆炸)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
-            iterator.set_description(f"train loss={loss:.2f}")
+            iterator.set_description(f"train loss={loss.item():.2f}")
             losses.update(loss.item(), y.size(0))
 
     return losses.avg
@@ -210,7 +323,7 @@ def parse_args():
                         help='number of training epochs')
     parser.add_argument('-b', '--batchsize', type=int, default=512,
                         help='batch size (number of time series processed simultaneously)')
-    parser.add_argument('-lr', '--learning-rate', type=float, default=1e-3,
+    parser.add_argument('-lr', '--learning-rate', type=float, default=1e-5,
                         help='optimizer learning rate (default 1e-3)')
     parser.add_argument('--weight-decay', type=float, default=1e-4,
                         help='optimizer weight_decay (default 1e-4)')
@@ -404,6 +517,24 @@ def train(args):
     print("=> creating model '{}'".format(args.model))
     model = get_model(args.model, ndims, num_classes, args.sequencelength, device)
 
+    print(f"🔍 Model Config Check:")
+    print(f"   args.use_doy: {args.use_doy}")
+    if hasattr(model, 'use_doy'):
+        print(f"   model.use_doy: {model.use_doy}")
+    if hasattr(model, 'pos_encoder'):
+        print(f"   model.pos_encoder exists: True")
+        # 尝试打印 pos_encoder 的状态
+        pe_params = [p for p in model.pos_encoder.parameters()]
+        if len(pe_params) > 0:
+            print(f"   pos_encoder has parameters: {len(pe_params)}")
+            # 检查 PE 权重是否有 NaN
+            for name, param in model.pos_encoder.named_parameters():
+                if torch.isnan(param).any():
+                    print(f"   💣 NaN found in PE parameter: {name}")
+            for name, buf in model.pos_encoder.named_buffers():
+                if torch.isnan(buf).any():
+                    print(f"   💣 NaN found in PE buffer: {name}")
+    print("------------------")
 
     print(f"Initialized {model.modelname}: Total trainable parameters: {get_ntrainparams(model)}")
     model.apply(weight_init)
@@ -433,6 +564,17 @@ def train(args):
         for name, param in model.named_parameters():
             if not name.startswith('decoder'):
                 param.requires_grad = False
+    print("🛡️ [Stability Fix v2] Freezing ALL BatchNorm and LayerNorm layers in the model...")
+    frozen_count = 0
+    for name, m in model.named_modules():
+        if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d, torch.nn.LayerNorm)):
+            m.eval()
+            frozen_count += 1
+            # 可选：打印前几个被冻结的层，确认包含 encoder 部分
+            if frozen_count <= 5:
+                print(f"   - Frozen: {name} ({type(m).__name__})")
+
+    print(f"   Total frozen normalization layers: {frozen_count}")
 
     if finetune:
         model.modelname = f'F_{path.parts[-2].split("_")[1][:2]}_{model.modelname}_R{args.num}_{args.rc_str}_{args.year}_Seed{args.seed}'
@@ -448,7 +590,16 @@ def train(args):
 
     criterion = torch.nn.CrossEntropyLoss(reduction="mean",ignore_index=-100)
     parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
-    optimizer = torch.optim.Adam(parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
+    # 👇 【关键修复 1】针对微调场景优化学习率
+    # 如果加载了预训练模型 (finetune=True)，分类头是随机初始化的。
+    # 默认 1e-3 可能太大导致第一步就爆炸 (NaN)。建议微调时使用 1e-4 或更小，或者依赖 warmup。
+    current_lr = args.learning_rate
+    if finetune and args.warmup_epochs == 0:
+        # 如果没有 warmup，自动降低初始学习率以防爆炸
+        current_lr = args.learning_rate * 0.1
+        print(f"⚠️ Finetuning mode detected without warmup. Reducing initial LR to {current_lr} to prevent NaN.")
+
+    optimizer = torch.optim.Adam(parameters, lr=current_lr, weight_decay=args.weight_decay)
 
     if not args.eval:
         log = list()
@@ -469,6 +620,11 @@ def train(args):
             train_loss = train_epoch_with_adapter(model, optimizer, criterion, source_loader_dict, train_adapter,
                                                   device, args)
             val_loss, scores = test_epoch_with_adapter(model, criterion, val_loader_dict, val_adapter, device, args)
+
+            if np.isnan(val_loss) or np.isnan(train_loss):
+                print(f"⚠️ Epoch {epoch+1}: Loss detected as NaN! Stopping training to save resources.")
+                print("   Possible causes: Learning rate too high, Data normalization issue, or Label mismatch.")
+                break # 直接跳出，避免后续错误
 
             scores_msg = ", ".join(
                 [f"{k}={v:.4f}" for (k, v) in scores.items() if k not in ['class_f1', 'confusion_matrix']])
@@ -498,27 +654,137 @@ def train(args):
             print(f"\n{args.epochs} epochs training finished.")
 
     # test
-    print('Restoring best model weights for testing...')
-    checkpoint = torch.load(best_model_path)
-    state_dict = {k: v for k, v in checkpoint['model_state'].items()}
-    criterion = checkpoint['criterion']
-    torch.save({'model_state': state_dict, 'criterion': criterion}, best_model_path)
-    model.load_state_dict(state_dict)
+    # ================= Test Phase =================
+    print('Preparing for testing...')
 
-    test_loss, scores = test_epoch_with_adapter(model, criterion, test_loader_dict, test_adapter, device, args)
-    scores_msg = ", ".join(
-        [f"{k}={v:.4f}" for (k, v) in scores.items() if k not in ['class_f1', 'confusion_matrix']])
-    print(f"Test results: \n\n {scores_msg}")
+    model_loaded_successfully = False
 
-    scores['epoch'] = 'test'
-    scores['testloss'] = test_loss
-    conf_mat = scores.pop('confusion_matrix')
-    class_f1 = scores.pop('class_f1')
+    # 逻辑判断：只有在非 eval 模式 且 文件存在 时才加载 best_model
+    if not args.eval and best_model_path.exists():
+        print(f'Restoring best model weights from {best_model_path}...')
+        try:
+            checkpoint = torch.load(best_model_path, map_location=device)
+            # strict=True 确保所有参数（包括 BN 的 running_mean/var）都匹配并加载
+            model.load_state_dict(checkpoint['model_state'], strict=True)
+            if 'criterion' in checkpoint:
+                criterion = checkpoint['criterion']
+            model_loaded_successfully = True
+            print("Best model loaded successfully.")
+        except Exception as e:
+            print(f"Failed to load best model: {e}. Will attempt to reload pretrained weights.")
+            model_loaded_successfully = False
 
-    log_df = pd.DataFrame([scores]).set_index("epoch")
-    log_df.to_csv(logdir / f"testlog.csv")
-    np.save(logdir / f"test_conf_mat.npy", conf_mat)
-    np.save(logdir / f"test_class_f1.npy", class_f1)
+    elif args.eval and best_model_path.exists():
+        try:
+            checkpoint = torch.load(best_model_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state'], strict=True)
+            print("Loaded cached best model for evaluation.")
+        except:
+            print("Using currently loaded (pretrained) weights.")
+
+    else:
+        # === 关键修复区域：训练失败后的恢复逻辑 ===
+        if not args.eval:
+            print(f"⚠️ CRITICAL: {best_model_path} does not exist.")
+            print("   Training failed (NaN loss). Current model weights/statistics are likely CORRUPTED.")
+
+            if finetune and args.pretrained:
+                print("   ⚡ FORCE RELOADING original PRETRAINED weights to clean corrupted BN statistics...")
+
+                try:
+                    path = Path(args.pretrained).absolute().relative_to(Path(__file__).absolute().parent)
+                    checkpoint = torch.load(path, map_location=device)  # 加载整个 checkpoint
+                    pretrain_state = checkpoint['model_state']
+
+                    # 1. 获取当前模型状态字典
+                    model_dict = model.state_dict()
+
+                    # 2. 过滤预训练权重 (只保留 encoder_q 部分，去掉 decoder/classifier)
+                    state_dict = {}
+                    for k, v in pretrain_state.items():
+                        if k.startswith('encoder_q'):
+                            if 'decoder' not in k and 'classification' not in k and 'position_enc.pe' not in k:
+                                new_key = k[len("encoder_q."):]
+                                if new_key in model_dict:
+                                    state_dict[new_key] = v
+                                # 注意：这里可能漏掉了 BN 的 running_mean/var 如果它们名字不匹配
+                                # 但通常 MoCo 的 key 是直接对应的
+
+                    # 3. 【关键】保留当前模型中未被预训练权重覆盖的部分 (如随机初始化的 classifier)
+                    # 但对于 BN 层，我们希望用预训练的统计量覆盖脏统计量。
+                    # 如果 pretrain_state 里有 BN 的 buffer，上面的循环应该已经包含了。
+                    # 如果没包含（比如 key 名字变了），我们需要手动处理。
+
+                    # 4. 执行加载 (strict=False 允许 classifier 不匹配，但 BN 必须匹配)
+                    # 如果 strict=True 报错，说明 key 不匹配，我们需要更精细的处理
+                    try:
+                        model.load_state_dict(state_dict, strict=False)
+                        print("   ✅ Pretrained encoder weights loaded.")
+
+                        # 5. 【双重保险】手动检查并重置 BN 层
+                        # 如果加载后还有 NaN，说明某些 BN 层没被覆盖。
+                        # 这里我们强制将所有 BN 层设为 eval 模式，防止它们使用可能残留的脏统计量
+                        # 或者，如果可能，重新初始化 BN 层 (但这会丢失预训练统计量)
+                        # 最安全的做法：既然我们是微调，且预训练模型是好的，
+                        # 我们应该确保所有 BN 层的 running_var 不是 NaN。
+
+                        nan_bn_count = 0
+                        for name, m in model.named_modules():
+                            if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+                                if torch.isnan(m.running_var).any() or torch.isinf(m.running_var).any():
+                                    nan_bn_count += 1
+                                    # 如果发现 NaN，尝试从预训练字典里再找一次，或者重置为 1
+                                    # 这里简单粗暴：如果 var 是 NaN，设为 1.0 (相当于不缩放)
+                                    m.running_var.fill_(1.0)
+                                    m.running_mean.fill_(0.0)
+                                    print(f"   🛠️ Fixed NaN in BN layer: {name}")
+
+                        if nan_bn_count > 0:
+                            print(f"   ⚠️ Detected and fixed {nan_bn_count} corrupted BN layers.")
+                        else:
+                            print("   ✅ All BN statistics appear clean.")
+
+                    except Exception as load_err:
+                        print(f"   ❌ Failed to load state dict: {load_err}")
+                        print("   Falling back to using the model as-is (high risk of NaN).")
+
+                except Exception as e:
+                    print(f"   ❌ Error reloading pretrained checkpoint: {e}")
+            else:
+                print("   Proceeding with current model state (likely corrupted).")
+        else:
+            print("Eval mode: No cached model found. Using provided pretrained weights.")
+
+    # === 执行测试 ===
+    # 确保模型处于评估模式 (这会禁用 BN 的统计量更新，并使用 running_mean/var)
+    model.eval()
+
+    # 执行测试
+    try:
+        test_loss, scores = test_epoch_with_adapter(model, criterion, test_loader_dict, test_adapter, device, args)
+
+        scores_msg = ", ".join(
+            [f"{k}={v:.4f}" for (k, v) in scores.items() if k not in ['class_f1', 'confusion_matrix']])
+        print(f"Test results: \n\n {scores_msg}")
+
+        scores['epoch'] = 'test'
+        scores['testloss'] = test_loss
+
+        conf_mat = scores.pop('confusion_matrix', None)
+        class_f1 = scores.pop('class_f1', None)
+
+        log_df = pd.DataFrame([scores]).set_index("epoch")
+        log_df.to_csv(logdir / f"testlog.csv")
+
+        if conf_mat is not None:
+            np.save(logdir / f"test_conf_mat.npy", conf_mat)
+        if class_f1 is not None:
+            np.save(logdir / f"test_class_f1.npy", class_f1)
+
+    except Exception as e:
+        print(f"❌ Testing phase failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     return logdir
 

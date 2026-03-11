@@ -61,7 +61,12 @@ class STNet(nn.Module):
         # weight
         if not is_bert:
             weight = self.dropout(weight)
-            weight /= weight.sum(1).unsqueeze(1)
+            # 👇 【新增修复】计算 sum 并防止除零
+            weight_sum = weight.sum(1, keepdim=True)
+            # 如果 sum 为 0 (或极小), 设为 1.0 避免 NaN
+            weight_sum = torch.where(weight_sum == 0, torch.ones_like(weight_sum), weight_sum)
+
+            weight = weight / weight_sum
             x = torch.bmm(weight.unsqueeze(1), x).squeeze()
 
         logits = self.decoder(x)
