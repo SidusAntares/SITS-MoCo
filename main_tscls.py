@@ -25,9 +25,14 @@ from transforms import (
 from torch.utils import data
 import numpy as np
 import pandas as pd
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import random
 from utils import *
+from datetime import datetime
+import os
 
+timestamp = datetime.now().strftime("%Y%m%d_%H%M")
 
 import torch
 
@@ -221,8 +226,6 @@ def parse_args():
                         help='whether to interplate the time series data')
     parser.add_argument('--useall', action='store_true',
                         help='whether to use all data for training')
-    parser.add_argument('-n', '--num', default=3000, type=int,
-                        help='number of labeled samples (training and validation) (default 3000)')
     parser.add_argument('-c', '--nclasses', type=int, default=20,
                         help='num of classes (default: 20)')
     parser.add_argument('--year', type=int, default=2019,
@@ -258,7 +261,12 @@ def parse_args():
     parser.add_argument('--freeze', action='store_true',
                         help='freeze pretrain model')
 
+    parser.add_argument('-n', '--num', default=3000, type=int,
+                        help='number of labeled samples (training and validation) (default 3000)')
+
     # 以下都是timematch
+    parser.add_argument('--gpus', type=int, default=4,
+                        help='Number of GPUs to use (0=CPU, 1=Single GPU, >=2=Multi-GPU DDP)')
     parser.add_argument(
         "--num_workers", default=8, type=int, help="Number of workers"
     )
@@ -273,7 +281,7 @@ def parse_args():
     # parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str,
     #                     help='Path to datasets root directory')
     parser.add_argument('--source', default='france/30TXT/2017', type=str)
-    parser.add_argument('--target', default='france/30TXT/2017', type=str)
+    # parser.add_argument('--target', default='france/31TCJ/2017', type=str)
     # 类别处理
     parser.add_argument('--combine_spring_and_winter', action='store_true')
     # 数据划分
@@ -390,7 +398,6 @@ def train(args):
     source_classes = label_utils.get_classes(cfg.source.split('/')[0],
                                              combine_spring_and_winter=cfg.combine_spring_and_winter)
     source_data = PixelSetData(cfg.data_root, cfg.source, source_classes)
-    target_data = PixelSetData(cfg.data_root, cfg.target, source_classes)
     labels, counts = np.unique(source_data.get_labels(), return_counts=True)
     source_classes = [source_classes[i] for i in labels[counts >= 200]]
     print('Using classes:', source_classes)
@@ -398,7 +405,7 @@ def train(args):
     cfg.num_classes = len(source_classes)  # 可以覆盖该参数的默认设置
 
     # 控制微调样本量
-    total_num = len(target_data)  # 获取全量长度
+    total_num = len(source_data)  # 获取全量长度
     if args.useall or args.num >= total_num:
         use_num = total_num
         print(f"Using all {total_num} samples.")
@@ -407,8 +414,8 @@ def train(args):
         print(f"⚠️ Limiting experiment pool to {use_num} random samples (Seed={args.seed}).")
 
     # Randomly assign parcels to train/val/test
-    indices = {config.target: use_num}
-    folds = create_train_val_test_folds([config.target], config.num_folds, indices, config.val_ratio,
+    indices = {config.source: use_num}
+    folds = create_train_val_test_folds([config.source], config.num_folds, indices, config.val_ratio,
                                         config.test_ratio)
     splits = folds[0]
     sample_pixels_val = config.sample_pixels_val
@@ -459,7 +466,7 @@ def train(args):
                 param.requires_grad = False
 
     if finetune:
-        model.modelname = f'F_{path.parts[-2].split("_")[1][:2]}_{model.modelname}_R{use_num}_{args.rc_str}_{args.year}_Seed{args.seed}'
+        model.modelname = f'finetune_R{use_num}_{args.source}_{timestamp}_Seed{args.seed}'
     else:
         model.modelname = f'T_{model.modelname}_R{use_num}_{args.rc_str}_{args.year}_Seed{args.seed}'
 
