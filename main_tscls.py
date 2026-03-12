@@ -3,8 +3,9 @@ This script is for time series classification task.
 """
 import copy
 import argparse
+
 from tqdm import tqdm
-from joblib import dump, load
+
 
 import torch.optim
 import torch.nn.functional as F
@@ -280,7 +281,7 @@ def parse_args():
                         help='Path to datasets root directory')
     # parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str,
     #                     help='Path to datasets root directory')
-    parser.add_argument('--source', default='denmark/32VNH/2017', type=str)
+    parser.add_argument('--source', default='france/31TCJ/2017', type=str)
     # parser.add_argument('--target', default='france/31TCJ/2017', type=str) denmark/32VNH/2017 austria/33UVP/2017 france/30TXT/2017
     # 类别处理
     parser.add_argument('--combine_spring_and_winter', action='store_true')
@@ -464,9 +465,20 @@ def train(args):
         for name, param in model.named_parameters():
             if not name.startswith('decoder'):
                 param.requires_grad = False
+    # france/31TCJ/2017', type=str) denmark/32VNH/2017 austria/33UVP/2017 france/30TXT/2017
+    match args.source:
+        case 'france/30TXT/2017':
+            source_name = 'FR1'
+        case 'france/31TCJ/2017':
+            source_name = 'FR2'
+        case 'denmark/32VNH/2017':
+            source_name = 'DK1'
+        case _:
+            source_name = 'AT1'
+
 
     if finetune:
-        model.modelname = f'finetune_R{use_num}_{args.source}_{timestamp}_Seed{args.seed}'
+        model.modelname = f'finetune_R{use_num}_{source_name}_{timestamp}_Seed{args.seed}'
     else:
         model.modelname = f'T_{model.modelname}_R{use_num}_{args.rc_str}_{args.year}_Seed{args.seed}'
 
