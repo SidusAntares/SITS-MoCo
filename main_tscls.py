@@ -262,9 +262,10 @@ def parse_args():
     parser.add_argument('--freeze', action='store_true',
                         help='freeze pretrain model')
 
-    parser.add_argument('-n', '--num', default=10000, type=int,
-                        help='number of labeled samples (training and validation) (default 3000)')
-
+    # parser.add_argument('-n', '--num', default=10000, type=int,
+    #                     help='number of labeled samples (training and validation) (default 3000)')
+    parser.add_argument('-n', '--per', default=0.3, type=int,
+                        help='percentage of labeled samples (training and validation) (default )')
     # 以下都是timematch
     parser.add_argument('--gpus', type=int, default=4,
                         help='Number of GPUs to use (0=CPU, 1=Single GPU, >=2=Multi-GPU DDP)')
@@ -407,11 +408,13 @@ def train(args):
 
     # 控制微调样本量
     total_num = len(source_data)  # 获取全量长度
-    if args.useall or args.num >= total_num:
+    if args.useall or args.per ==1 :
         use_num = total_num
         print(f"Using all {total_num} samples.")
+    elif args.per>1 or args.per <0:
+        raise ValueError('Percentage must be between 0 and 1')
     else:
-        use_num = args.num
+        use_num = round(args.per * total_num)
         print(f"⚠️ Limiting experiment pool to {use_num} random samples (Seed={args.seed}).")
 
     # Randomly assign parcels to train/val/test
@@ -478,7 +481,7 @@ def train(args):
 
 
     if finetune:
-        model.modelname = f'finetune_R{use_num}_{source_name}_{timestamp}_Seed{args.seed}'
+        model.modelname = f'{source_name}/finetune_R{use_num}_{timestamp}_Seed{args.seed}'
     else:
         model.modelname = f'T_{model.modelname}_R{use_num}_{args.rc_str}_{args.year}_Seed{args.seed}'
 
@@ -578,10 +581,13 @@ def train(args):
              if k not in ['class_f1', 'confusion_matrix']]
         )
         print(f"\nTest Results:\n{scores_msg}")
+        print(f"total_num : {total_num} ; percentage : {args.per*100}%")
 
         # 保存结果
         scores['epoch'] = 'test'
         scores['testloss'] = test_loss
+        scores['total_num'] = total_num
+        scores['percentage'] = args.per
 
         # 提取并单独保存矩阵和 F1
         conf_mat = scores.pop('confusion_matrix', None)
