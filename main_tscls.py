@@ -395,7 +395,6 @@ def create_train_val_test_folds(datasets, num_folds, num_indices, val_ratio=0.1,
 
 def train(args):
     print("=> creating dataloader")
-    random.seed(10)
     config = cfg = args
     source_classes = label_utils.get_classes(cfg.source.split('/')[0],
                                              combine_spring_and_winter=cfg.combine_spring_and_winter)
@@ -416,6 +415,7 @@ def train(args):
     else:
         use_num = round(args.per * total_num)
         print(f"⚠️ Limiting experiment pool to {use_num} random samples (Seed={args.seed}).")
+    print(f"(Seed={args.seed}).")
 
     # Randomly assign parcels to train/val/test
     indices = {config.source: use_num}
@@ -668,25 +668,22 @@ def test_epoch(model, criterion, dataloader, device, args):
 
 def main():
     args = parse_args()
-    years = [2019]
-    for year in years:
-        print(f' ===================== {year} ======================= ')
-        args.year = year
-        seeds = [111]
-        print('seed in', seeds)
-        for seed in seeds:
-            args.seed = seed
-            print(f'Seed = {args.seed} --------------- ')
+    seeds = [111]
+    print('seed in', seeds)
+    for seed in seeds:
+        args.seed = seed
+        print(f'Seed = {args.seed} --------------- ')
 
-            SEED = args.seed
-            random.seed(SEED)
-            np.random.seed(SEED)
-            torch.manual_seed(SEED)
-            torch.cuda.manual_seed_all(SEED)
-            torch.backends.cudnn.deterministic = True
+        SEED = args.seed
+        random.seed(SEED)
+        np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        torch.backends.cudnn.deterministic = True
 
-            logdir = train(args)
-        overall_performance(str(logdir))
+        logdir = train(args)
+    overall_performance(str(logdir))
+
 
 
 if __name__ == '__main__':
