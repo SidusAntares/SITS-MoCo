@@ -266,6 +266,8 @@ def parse_args():
     #                     help='number of labeled samples (training and validation) (default 3000)')
     parser.add_argument('-n', '--per', default=0.3, type=int,
                         help='percentage of labeled samples (training and validation) (default )')
+    parser.add_argument('--seed', default=111, type=int,
+                        help='seed')
     # 以下都是timematch
     parser.add_argument('--gpus', type=int, default=4,
                         help='Number of GPUs to use (0=CPU, 1=Single GPU, >=2=Multi-GPU DDP)')
@@ -671,7 +673,7 @@ def main():
     seeds = [111]
     print('seed in', seeds)
     for seed in seeds:
-        args.seed = seed
+        # args.seed = seed
         print(f'Seed = {args.seed} --------------- ')
 
         SEED = args.seed
