@@ -3,6 +3,7 @@ This script is for time series classification task.
 """
 import copy
 import argparse
+import sys
 
 from tqdm import tqdm
 
@@ -21,7 +22,6 @@ from transforms import (
     RandomSamplePixels,
     RandomSampleTimeSteps,
     ToTensor,
-    AddPixelLabels
 )
 from torch.utils import data
 import numpy as np
@@ -52,7 +52,7 @@ class TimeMatchToUSCropsAdapter:
         pixels = batch_dict['pixels']  # [B, T, C, N]
         positions = batch_dict['positions']  # [B, N] (DOY)
         valid_pixels = batch_dict['valid_pixels']  # [B, N, T] (0/1)
-        pixel_labels = batch_dict['pixel_labels']  # [B, N]
+        pixel_labels = batch_dict['label']  # [B, ]
 
         B, T, C, N = pixels.shape
 
@@ -62,46 +62,6 @@ class TimeMatchToUSCropsAdapter:
         valid_flat = valid_pixels.permute(0, 2, 1).reshape(-1, T).bool()  # [S, T]
         mask_flat = ~valid_flat  # [S, T] (True=Invalid)
         y_flat = pixel_labels.reshape(-1).long()  # [S]
-
-        # 2. 【关键修复】处理全无效时间步样本 (All Invalid Time Steps)
-        # 现象：随机采样可能导致某像素所有时间步都被云遮挡 (valid_flat 全 False)
-        # 后果：STNet 计算权重和时分母为 0 -> NaN
-        # 策略：强制将第一个时间步标记为有效，并在 Loss 中忽略该样本
-        has_valid_time = valid_flat.any(dim=1)
-        all_invalid_mask = ~has_valid_time
-
-        if all_invalid_mask.any():
-            count = all_invalid_mask.sum().item()
-            if self.warn_count < 3:
-                print(f"⚠️ Fixing {count} all-invalid samples (forcing t=0 valid).")
-                self.warn_count += 1
-
-            # 强制修正 Mask
-            valid_flat[all_invalid_mask, 0] = True
-            mask_flat[all_invalid_mask, 0] = False
-            has_valid_time = valid_flat.any(dim=1)  # 更新状态
-
-        # 3. 处理数据中的 NaN/Inf (数值清洗)
-        # 将脏数据替换为 0，并将对应 Label 设为 Ignore (-100)
-        dirty_mask = torch.isnan(data_flat) | torch.isinf(data_flat)
-        if dirty_mask.any():
-            sample_dirty = dirty_mask.any(dim=(1, 2))
-            y_flat = y_flat.float()
-            y_flat[sample_dirty] = -100.0
-            y_flat = y_flat.long()
-            data_flat[dirty_mask] = 0.0
-
-            if self.warn_count < 3:
-                print(f"⚠️ Cleaned {sample_dirty.sum()} samples with NaN/Inf values.")
-                self.warn_count += 1
-
-        # 4. 应用 Label Ignore
-        # 如果样本依然没有有效时间步 (理论上已被步骤 2 修复，此处为双重保险)，设为 -100
-        IGNORE_INDEX = -100
-        y_flat = torch.where(has_valid_time, y_flat, torch.tensor(IGNORE_INDEX, dtype=y_flat.dtype))
-
-        # 5. 最终安全检查
-        data_flat = torch.nan_to_num(data_flat, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 构建输入元组
         X_tuple = (data_flat, mask_flat, doy_flat, valid_flat.float())
@@ -130,7 +90,7 @@ def train_epoch_with_adapter(model, optimizer, criterion, dict_dataloader, adapt
                 X, y = adapter(batch_dict)
             except Exception as e:
                 print(f"Error adapting batch {idx}: {e}")
-                continue
+                raise f"Error adapting batch {idx}: {e}"
 
             if y.device != device:
                 y = y.to(device)
@@ -144,7 +104,9 @@ def train_epoch_with_adapter(model, optimizer, criterion, dict_dataloader, adapt
 
 
             out = F.log_softmax(logits, dim=-1)
-
+            print("================train:")
+            print(out.shape)
+            print(y.shape)
             loss = criterion(out, y)
 
             loss.backward()
@@ -187,6 +149,10 @@ def test_epoch_with_adapter(model, criterion, dict_dataloader, adapter, device, 
                     logits = model(X)
 
                 out = F.log_softmax(logits, dim=-1)
+                print("================test:")
+                print(out.shape)
+                print(y.shape)
+                sys.exit()
                 loss = criterion(out, y)
 
                 iterator.set_description(f"test loss={loss:.2f}")
@@ -264,7 +230,7 @@ def parse_args():
 
     # parser.add_argument('-n', '--num', default=10000, type=int,
     #                     help='number of labeled samples (training and validation) (default 3000)')
-    parser.add_argument('-n', '--per', default=0.3, type=int,
+    parser.add_argument('-n', '--per', default=0.01, type=int,
                         help='percentage of labeled samples (training and validation) (default )')
     parser.add_argument('--seed', default=111, type=int,
                         help='seed')
@@ -276,11 +242,11 @@ def parse_args():
     )
     parser.add_argument("--batch_size", type=int, default=500)
     parser.add_argument("--balance_source", type=bool_flag, default=True, help='class balanced batches for source')
-    parser.add_argument('--num_pixels', default=50, type=int, help='Number of pixels to sample from the input sample')
+    parser.add_argument('--num_pixels', default=1, type=int, help='Number of pixels to sample from the input sample')
     parser.add_argument('--seq_length', default=30, type=int,
                         help='Number of time steps to sample from the input sample')
     # 数据路径与域
-    parser.add_argument('--data_root', default='/data/user/DBL/timematch_data', type=str,
+    parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str,
                         help='Path to datasets root directory')
     # parser.add_argument('--data_root', default='/mnt/d/All_Documents/documents/ViT/dataset/timematch', type=str,
     #                     help='Path to datasets root directory')
@@ -334,7 +300,7 @@ def get_data_loaders(splits, config, balance_source=True):
             RandomSampleTimeSteps(config.seq_length),
             Normalize(),
             ToTensor(),
-            AddPixelLabels()
+
     ])
 
     source_dataset = PixelSetData(config.data_root, config.source,
@@ -492,7 +458,7 @@ def train(args):
     best_model_path = logdir / 'model_best.pth'
     print(f"Logging results to {logdir}")
 
-    criterion = torch.nn.CrossEntropyLoss(reduction="mean",ignore_index=-100)
+    criterion = torch.nn.CrossEntropyLoss()
     parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     optimizer = torch.optim.Adam(parameters, lr=args.learning_rate, weight_decay=args.weight_decay)
 

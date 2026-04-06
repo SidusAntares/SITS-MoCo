@@ -124,28 +124,3 @@ class ToTensor(object):
         return sample
 
 
-# 在 transforms.py 中添加
-class AddPixelLabels:
-    def __init__(self, num_classes=None):
-        # num_classes 可选，这里不需要
-        pass
-
-    def __call__(self, sample):
-        """
-        sample 应包含:
-          - 'pixels': (T, C, N)
-          - 'label': scalar (int or tensor)
-        添加:
-          - 'pixel_labels': (N,)
-        """
-        pixels = sample['pixels']
-        parcel_label = sample['label']
-        N = pixels.shape[-1]  # 现在 N 是固定的（因为前面已 RandomSamplePixels）
-
-        # 确保 parcel_label 是 int
-        if isinstance(parcel_label, torch.Tensor):
-            parcel_label = parcel_label.item()
-
-        pixel_labels = torch.full((N,), parcel_label, dtype=torch.long)
-        sample['pixel_labels'] = pixel_labels
-        return sample
